@@ -1,0 +1,213 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: impact-postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-impact_analysis}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - impact-network
+
+  # MongoDB Database
+  mongodb:
+    image: mongo:7
+    container_name: impact-mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-admin}
+    volumes:
+      - mongo_data:/data/db
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - impact-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: impact-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - impact-network
+
+  # API Gateway
+  api-gateway:
+    build:
+      context: ./services/api-gateway
+      dockerfile: Dockerfile
+    container_name: impact-api-gateway
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=${ENVIRONMENT:-development}
+      - PORT=3000
+      - JWT_SECRET=${JWT_SECRET}
+      - REPOSITORY_SCANNER_URL=http://repository-scanner:8001
+      - IMPACT_ANALYZER_URL=http://impact-analyzer:8002
+      - AI_ORCHESTRATOR_URL=http://ai-orchestrator:8003
+      - TEST_GENERATOR_URL=http://test-generator:8004
+      - POSTGRES_URI=postgresql://${DB_USER}:${DB_PASSWORD}@postgres:5432/${DB_NAME}
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      repository-scanner:
+        condition: service_started
+      ai-orchestrator:
+        condition: service_started
+    networks:
+      - impact-network
+    restart: unless-stopped
+
+  # Repository Scanner Service
+  repository-scanner:
+    build:
+      context: ./services/repository-scanner
+      dockerfile: Dockerfile
+    container_name: impact-repo-scanner
+    environment:
+      - MONGODB_URI=mongodb://${MONGO_USER}:${MONGO_PASSWORD}@mongodb:27017/
+      - REDIS_URL=redis://redis:6379
+      - GIT_CLONE_PATH=/app/repos
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - repo_clones:/app/repos
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - impact-network
+    restart: unless-stopped
+
+  # Impact Analyzer Service
+  impact-analyzer:
+    build:
+      context: ./services/impact-analyzer
+      dockerfile: Dockerfile
+    container_name: impact-analyzer
+    environment:
+      - MONGODB_URI=mongodb://${MONGO_USER}:${MONGO_PASSWORD}@mongodb:27017/
+      - REDIS_URL=redis://redis:6379
+      - CRITICALITY_THRESHOLD=${CRITICALITY_THRESHOLD:-0.7}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - impact-network
+    restart: unless-stopped
+
+  # AI Orchestrator Service
+  ai-orchestrator:
+    build:
+      context: ./services/ai-orchestrator
+      dockerfile: Dockerfile
+    container_name: impact-ai-orchestrator
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - MONGODB_URI=mongodb://${MONGO_USER}:${MONGO_PASSWORD}@mongodb:27017/
+      - REDIS_URL=redis://redis:6379
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-3-small}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4-turbo-preview}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.2}
+      - CHUNK_SIZE=${CHUNK_SIZE:-1000}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-200}
+      - TOP_K_RETRIEVAL=${TOP_K_RETRIEVAL:-10}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - chroma_data:/app/chroma_db
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - impact-network
+    restart: unless-stopped
+
+  # Test Generator Service
+  test-generator:
+    build:
+      context: ./services/test-generator
+      dockerfile: Dockerfile
+    container_name: impact-test-generator
+    environment:
+      - MONGODB_URI=mongodb://${MONGO_USER}:${MONGO_PASSWORD}@mongodb:27017/
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - impact-network
+    restart: unless-stopped
+
+  # Frontend (Optional - for development)
+  frontend:
+    build:
+      context: ./services/frontend
+      dockerfile: Dockerfile
+      target: development
+    container_name: impact-frontend
+    ports:
+      - "3001:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:3000/api/v1
+      - NODE_ENV=development
+    volumes:
+      - ./services/frontend/src:/app/src
+      - ./services/frontend/public:/app/public
+    depends_on:
+      - api-gateway
+    networks:
+      - impact-network
+
+volumes:
+  postgres_data:
+    driver: local
+  mongo_data:
+    driver: local
+  redis_data:
+    driver: local
+  repo_clones:
+    driver: local
+  chroma_data:
+    driver: local
+
+networks:
+  impact-network:
+    driver: bridge
